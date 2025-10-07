@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-DXHL_FILES_IMPL]
