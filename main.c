@@ -1,38 +1,18 @@
 #define XHL_ALLOC_IMPL
 #define XHL_FILES_IMPL
-#define XHL_MATHS_IMPL
 
 #define XARR_REALLOC xrealloc
 #define XARR_FREE    xfree
 
-#include <errno.h>
-#include <fcntl.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/event.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
+
 #include <xhl/alloc.h>
 #include <xhl/array.h>
 #include <xhl/debug.h>
 #include <xhl/files.h>
-#include <xhl/maths.h>
-
-enum FileEventType
-{
-    FE_CONTINUE,
-    FE_CREATED,
-    FE_DELETED,
-    FE_CONTENTS_MODIFIED,
-    FE_ATTRIBUTES_MODIFIED,
-
-    // NOTE: Tracking "rename" events is rarely a useful feature for apps, and an absolute PITA to try and track using
-    // the kqueue API, with a great risk of failure.
-    // EVENT_FILE_MOVED,
-};
 
 /* A simple routine to return a string for a set of flags. */
 char* flagstring(int flags)
@@ -101,6 +81,19 @@ struct WatchFolder
     size_t stringpool_offset;
 };
 
+enum FileEventType
+{
+    FE_CONTINUE,
+    FE_CREATED,
+    FE_DELETED,
+    FE_CONTENTS_MODIFIED,
+    FE_ATTRIBUTES_MODIFIED,
+
+    // NOTE: Tracking "rename" events is rarely a useful feature for apps, and an absolute PITA to try and track using
+    // the kqueue API, with a great risk of failure.
+    // EVENT_FILE_MOVED,
+};
+
 // If type == FE_CONTINUE, return nonzero to return from watch callback
 typedef int (*file_event_cb_t)(enum FileEventType type, const char* path, void* udata);
 
@@ -115,18 +108,15 @@ struct Context
     file_event_cb_t callback;
 };
 
-typedef struct Stringpool
-{
-} Stringpool;
-
 static size_t add_string(struct Context* ctx, const char* str, size_t len)
 {
     size_t offset = xarr_len(ctx->stringpool);
     xassert((offset & 15) == 0);
 
-    size_t nextlen = offset + len + 1; // +1 for '\0' byte
-    nextlen        = xm_align_up(nextlen, 16);
+    size_t nextlen = offset + len + 1;       // +1 for '\0' byte
+    nextlen        = (nextlen + 0xf) & ~0xf; // Round to 16 byte boundary
     xassert((nextlen & 15) == 0);
+
     xarr_setlen(ctx->stringpool, nextlen);
 
     memcpy(ctx->stringpool + offset, str, len);
@@ -135,21 +125,6 @@ static size_t add_string(struct Context* ctx, const char* str, size_t len)
     return offset;
 }
 
-bool check_is_directory(const char* path)
-{
-    bool        is_dir = false;
-    struct stat info   = {0};
-    if (stat(path, &info) == 0)
-    {
-        if (info.st_mode & S_IFDIR)
-        {
-            is_dir = true;
-        }
-    }
-    return is_dir;
-}
-
-// TODO: add items to context array
 void watch_path(struct Context* ctx, const char* path_, bool is_dir)
 {
     struct kevent      event;
@@ -371,8 +346,7 @@ void watch_dir(const char** paths, int npaths, uint64_t cb_frequency_ns, void* u
                 bool currently_exists   = xfiles_exists(ev_path);
 
                 printf(
-                    "Event %" PRIdPTR " occurred.  Filter %d, flags %d, filter flags %s, filter data %" PRIdPTR
-                    ", path %s\n",
+                    "Event %lu occurred.  Filter %d, flags %d, filter flags %s, filter data %lu, path %s\n",
                     e->ident,
                     e->filter,
                     e->flags,
@@ -421,15 +395,14 @@ void watch_dir(const char** paths, int npaths, uint64_t cb_frequency_ns, void* u
 
                 if (previously_existed && currently_exists)
                 {
-                    bool is_dir = wf->is_dir;
-                    if (is_dir)
-                    {
-                        // Dir was modified. A new file may have been added
-                        xfiles_list(ev_path, &ctx, cb_poll_for_new_entries);
-                    }
-
                     if (e->fflags & NOTE_WRITE)
+                    {
                         ctx.callback(FE_CONTENTS_MODIFIED, ev_path, ctx.udata);
+
+                        // Dir was modified. A new file may have been added
+                        if (wf->is_dir)
+                            xfiles_list(ev_path, &ctx, cb_poll_for_new_entries);
+                    }
                     if (e->fflags & NOTE_ATTRIB)
                         ctx.callback(FE_ATTRIBUTES_MODIFIED, ev_path, ctx.udata);
                 }
