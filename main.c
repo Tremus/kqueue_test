@@ -23,41 +23,16 @@
 
 enum FileEventType
 {
-    EVENT_FILE_CREATED,
-    EVENT_FILE_DELETED,
-    EVENT_FILE_CONTENTS_MODIFIED,
-    EVENT_FILE_ATTRIBUTES_MODIFIED,
+    FE_CONTINUE,
+    FE_CREATED,
+    FE_DELETED,
+    FE_CONTENTS_MODIFIED,
+    FE_ATTRIBUTES_MODIFIED,
 
     // NOTE: Tracking "rename" events is rarely a useful feature for apps, and an absolute PITA to try and track using
     // the kqueue API, with a great risk of failure.
     // EVENT_FILE_MOVED,
 };
-
-// Note: path 1 is nonnull
-// path 2 is NULL unless type == EVENT_FILE_MOVED
-void cb_file_event(enum FileEventType type, const char* path_1)
-{
-    xassert(path_1);
-    switch (type)
-    {
-    case EVENT_FILE_CREATED:
-        printf("EVENT_FILE_CREATED: %s\n", path_1);
-        break;
-    case EVENT_FILE_DELETED:
-        printf("EVENT_FILE_DELETED: %s\n", path_1);
-        break;
-    case EVENT_FILE_CONTENTS_MODIFIED:
-        printf("EVENT_FILE_CONTENTS_MODIFIED: %s\n", path_1);
-        break;
-    case EVENT_FILE_ATTRIBUTES_MODIFIED:
-        printf("EVENT_FILE_ATTRIBUTES_MODIFIED: %s\n", path_1);
-        break;
-        // case EVENT_FILE_MOVED:
-        //     xassert(path_2);
-        //     printf("EVENT_FILE_MOVED: %s > %s\n", path_1, path_2);
-        //     break;
-    }
-}
 
 /* A simple routine to return a string for a set of flags. */
 char* flagstring(int flags)
@@ -126,12 +101,18 @@ struct WatchFolder
     size_t stringpool_offset;
 };
 
+// If type == FE_CONTINUE, return nonzero to return from watch callback
+typedef int (*file_event_cb_t)(enum FileEventType type, const char* path, void* udata);
+
 // https://man.freebsd.org/cgi/man.cgi?kqueue
 struct Context
 {
     struct kevent*      events;     // xarray
     struct WatchFolder* folders;    // xarray
     char*               stringpool; // xarray
+
+    void*           udata;
+    file_event_cb_t callback;
 };
 
 typedef struct Stringpool
@@ -169,13 +150,13 @@ bool check_is_directory(const char* path)
 }
 
 // TODO: add items to context array
-void watch_path(struct Context* ctx, const char* path_)
+void watch_path(struct Context* ctx, const char* path_, bool is_dir)
 {
     struct kevent      event;
     struct WatchFolder wf;
 
     wf.fd                = open(path_, O_EVTONLY);
-    wf.is_dir            = check_is_directory(path_);
+    wf.is_dir            = is_dir;
     wf.stringpool_offset = add_string(ctx, path_, strlen(path_));
     char* path           = ctx->stringpool + wf.stringpool_offset;
     xassert(path >= ctx->stringpool);
@@ -283,7 +264,7 @@ void cb_on_direntry(void* data, const xfiles_list_item_t* item)
         return;
 
     struct Context* ctx = data;
-    watch_path(ctx, item->path);
+    watch_path(ctx, item->path, item->is_dir);
 
     if (item->is_dir)
     {
@@ -303,8 +284,8 @@ void cb_poll_for_new_entries(void* data, const xfiles_list_item_t* item)
     int             idx = find_path_by_string(ctx, item->path);
     if (idx == -1)
     {
-        watch_path(ctx, item->path);
-        cb_file_event(EVENT_FILE_CREATED, item->path);
+        watch_path(ctx, item->path, item->is_dir);
+        ctx->callback(FE_CREATED, item->path, ctx->udata);
 
         if (item->is_dir)
         {
@@ -313,28 +294,31 @@ void cb_poll_for_new_entries(void* data, const xfiles_list_item_t* item)
     }
 }
 
-int main()
+void watch_dir(const char** paths, int npaths, uint64_t cb_frequency_ns, void* udata, file_event_cb_t cb)
 {
     int            kq  = 0;
     struct Context ctx = {0};
-    xalloc_init();
     ctx_init(&ctx);
 
-    static const char* WATCH_ROOT_PATH = WATCH_DIR;
+    ctx.udata    = udata;
+    ctx.callback = cb;
 
-    watch_path(&ctx, WATCH_ROOT_PATH);
-    xfiles_list(WATCH_ROOT_PATH, &ctx, cb_on_direntry);
-
-    /* Set the timeout to wake us every half second. */
-    struct timespec timeout;
-    timeout.tv_sec    = 0;         // 0 seconds
-    timeout.tv_nsec   = 500000000; // 500 milliseconds
-    int continue_loop = 40;        /* Monitor for twenty seconds. */
+    for (int i = 0; i < npaths; i++)
+    {
+        const char* p = paths[i];
+        watch_path(&ctx, p, true);
+        xfiles_list(p, &ctx, cb_on_direntry);
+    }
 
     kq = kqueue();
 
-    while (--continue_loop)
+    int should_quit = 0;
+    while (should_quit == 0)
     {
+        struct timespec timeout;
+        timeout.tv_sec  = 0;
+        timeout.tv_nsec = cb_frequency_ns;
+
         struct kevent event_data[69] = {0};
         size_t        nevents        = xarr_len(ctx.events);
         int           event_count    = kevent(kq, ctx.events, nevents, event_data, XFILES_ARRLEN(event_data), &timeout);
@@ -350,35 +334,6 @@ int main()
             printf("%d new events\n", event_count);
             for (int i = 0; i < event_count; i++)
             {
-                // NOTE: The control over the event loop with kevent is nice, but the info returned absolutely sucks.
-                // There is no simple "file created" or "file deleted" event to respond to
-                // If you create a folder in Finder, you get a NOTE_WRITE|NOTE_LINK event
-                // If you move a folder to the Trash, you get a NOTE_WRITE|NOTE_LINK event...?
-                // If you `rm -R` a folder, you get a NOTE_WRITE|NOTE_LINK event, not a NOTE_DELETE event???
-                // kevents are effectively triggers for doing your own polling
-                struct kevent* e = event_data + i;
-                xassert(e->filter == EVFILT_VNODE);
-
-                int cached_path_idx = find_path_by_fd(&ctx, e->ident);
-                xassert(cached_path_idx != -1);
-
-                const struct WatchFolder* wf                 = ctx.folders + cached_path_idx;
-                const char*               ev_path            = ctx.stringpool + wf->stringpool_offset;
-                bool                      previously_existed = cached_path_idx != -1;
-                bool                      currently_exists   = xfiles_exists(ev_path);
-
-                printf(
-                    "Event %" PRIdPTR " occurred.  Filter %d, flags %d, filter flags %s, filter data %" PRIdPTR
-                    ", path %s\n",
-                    e->ident,
-                    e->filter,
-                    e->flags,
-                    flagstring(e->fflags),
-                    e->data,
-                    ev_path);
-
-                struct WatchFolder(*view_folders)[512] = (void*)ctx.folders;
-
                 // Helpful table pulled from here:
                 // https://github.com/segmentio/fs/blob/main/notify_darwin.go
                 // | Condition                               | Events                   |
@@ -397,15 +352,44 @@ int main()
                 // | truncating a file                       | NOTE_ATTRIB              |
                 // | overwriting a symlink                   | NOTE_DELETE, NOTE_RENAME |
 
+                // NOTE: The control over the event loop with kevent is nice, but the info returned absolutely sucks.
+                // There is no simple "file created" or "file deleted" event to respond to
+                // If you create a folder in Finder, you get a NOTE_WRITE|NOTE_LINK event
+                // If you move a folder to the Trash, you get a NOTE_WRITE|NOTE_LINK event...?
+                // If you `rm -R` a folder, you get a NOTE_WRITE|NOTE_LINK event, not a NOTE_DELETE event???
+                // kevents are effectively triggers for doing your own polling
+                struct kevent* e = event_data + i;
+                xassert(e->filter == EVFILT_VNODE);
+
+                int cached_path_idx = find_path_by_fd(&ctx, e->ident);
+                xassert(cached_path_idx != -1);
+
+                const struct WatchFolder* wf      = ctx.folders + cached_path_idx;
+                const char*               ev_path = ctx.stringpool + wf->stringpool_offset;
+
+                bool previously_existed = cached_path_idx != -1;
+                bool currently_exists   = xfiles_exists(ev_path);
+
+                printf(
+                    "Event %" PRIdPTR " occurred.  Filter %d, flags %d, filter flags %s, filter data %" PRIdPTR
+                    ", path %s\n",
+                    e->ident,
+                    e->filter,
+                    e->flags,
+                    flagstring(e->fflags),
+                    e->data,
+                    ev_path);
+
+                struct WatchFolder(*view_folders)[512] = (void*)ctx.folders;
+
                 if (previously_existed && !currently_exists)
                 {
-
                     xassert(find_path_by_fd(&ctx, e->ident) != -1);
 
                     if (!wf->is_dir)
                     {
                         remove_watch_at_index(&ctx, cached_path_idx);
-                        cb_file_event(EVENT_FILE_DELETED, ev_path);
+                        ctx.callback(FE_DELETED, ev_path, ctx.udata);
                     }
                     else
                     {
@@ -425,11 +409,11 @@ int main()
                             }
 
                             bool is_substring = *a == 0 && *b != 0;
-                            if (is_substring)
+                            if (is_substring) // must be child directory or file
                             {
                                 xassert(!xfiles_exists(candidate_path));
                                 remove_watch_at_index(&ctx, j);
-                                cb_file_event(EVENT_FILE_DELETED, candidate_path);
+                                ctx.callback(FE_DELETED, candidate_path, ctx.udata);
                             }
                         }
                     }
@@ -445,24 +429,63 @@ int main()
                     }
 
                     if (e->fflags & NOTE_WRITE)
-                        cb_file_event(EVENT_FILE_CONTENTS_MODIFIED, ev_path);
+                        ctx.callback(FE_CONTENTS_MODIFIED, ev_path, ctx.udata);
                     if (e->fflags & NOTE_ATTRIB)
-                        cb_file_event(EVENT_FILE_ATTRIBUTES_MODIFIED, ev_path);
+                        ctx.callback(FE_ATTRIBUTES_MODIFIED, ev_path, ctx.udata);
                 }
             }
         }
-        else
-        {
-            printf("No event.\n");
-        }
 
-        /* Reset the timeout.  In case of a signal interrruption, the
-           values may change. */
-        timeout.tv_sec  = 0;         // 0 seconds
-        timeout.tv_nsec = 500000000; // 500 milliseconds
+        should_quit = ctx.callback(FE_CONTINUE, NULL, ctx.udata);
     }
 
     ctx_deinit(&ctx);
+}
+
+int cb_file_event(enum FileEventType type, const char* path, void* udata)
+{
+    int ret = 0;
+    switch (type)
+    {
+    case FE_CONTINUE:
+    {
+        xassert(path == NULL);
+        static int counter = 0;
+        counter++;
+        printf("FE_CONTINUE: %d\n", counter);
+        if (counter == 40)
+            ret = 1;
+        break;
+    }
+    case FE_CREATED:
+        xassert(path != NULL);
+        printf("FE_CREATED: %s\n", path);
+        break;
+    case FE_DELETED:
+        xassert(path != NULL);
+        printf("FE_DELETED: %s\n", path);
+        break;
+    case FE_CONTENTS_MODIFIED:
+        xassert(path != NULL);
+        printf("FE_CONTENTS_MODIFIED: %s\n", path);
+        break;
+    case FE_ATTRIBUTES_MODIFIED:
+        xassert(path != NULL);
+        printf("FE_ATTRIBUTES_MODIFIED: %s\n", path);
+        break;
+    }
+
+    return ret;
+}
+
+int main()
+{
+    xalloc_init();
+
+    const char* paths[]               = {WATCH_DIR};
+    uint64_t    callback_frequency_ns = 500000000; // 0.5 seconds
+    watch_dir(paths, XFILES_ARRLEN(paths), callback_frequency_ns, NULL, cb_file_event);
+
     xalloc_shutdown();
     return 0;
 }
